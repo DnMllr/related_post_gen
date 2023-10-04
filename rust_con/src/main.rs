@@ -1,7 +1,7 @@
 use std::{collections::BinaryHeap, time::Instant};
 
+use ahash::AHashMap;
 use rayon::prelude::*;
-use rustc_data_structures::fx::FxHashMap;
 use serde::{Deserialize, Serialize};
 use serde_json::from_str;
 
@@ -9,26 +9,23 @@ use mimalloc::MiMalloc;
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 
-type SString = smallstr::SmallString<[u8; 16]>;
-
 #[derive(Serialize, Deserialize)]
-struct Post {
-    _id: SString,
-    title: String,
+struct Post<'a> {
+    _id: &'a str,
+    title: &'a str,
     // #[serde(skip_serializing)]
-    tags: Vec<SString>,
+    tags: Vec<&'a str>,
 }
 
 const NUM_TOP_ITEMS: usize = 5;
 
 #[derive(Serialize)]
-struct RelatedPosts<'a> {
-    _id: &'a SString,
-    tags: &'a Vec<SString>,
-    related: Vec<&'a Post>,
+struct RelatedPosts<'a, 'b> {
+    _id: &'a str,
+    tags: &'b [&'a str],
+    related: Vec<&'b Post<'a>>,
 }
 
-#[derive(Eq)]
 struct PostCount {
     post: usize,
     count: usize,
@@ -39,6 +36,8 @@ impl std::cmp::PartialEq for PostCount {
         self.count == other.count
     }
 }
+
+impl std::cmp::Eq for PostCount {}
 
 impl std::cmp::PartialOrd for PostCount {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
@@ -68,69 +67,67 @@ fn least_n<T: Ord>(n: usize, mut from: impl Iterator<Item = T>) -> impl Iterator
     h.into_iter()
 }
 
-fn main() {
-    let json_str = std::fs::read_to_string("../posts.json").unwrap();
-    let posts: Vec<Post> = from_str(&json_str).unwrap();
-    let num_cpus = num_cpus::get_physical(); // does IO to get num_cpus
+fn new_hash_map<'a>() -> AHashMap<&'a str, Vec<usize>> {
+    AHashMap::with_capacity_and_hasher(32, ahash::RandomState::with_seed(123))
+}
 
-    let start = Instant::now();
+fn posts_to_related<'a, 'b>(posts: &'b [Post<'a>]) -> Vec<RelatedPosts<'a, 'b>> {
+    let post_tags_map = posts
+        .iter()
+        .enumerate()
+        .flat_map(|(i, p)| p.tags.iter().map(move |t| (i, t)))
+        .fold(new_hash_map(), |mut m, (i, t)| {
+            m.entry(t).or_insert_with(|| Vec::with_capacity(32)).push(i);
+            m
+        });
 
-    let mut post_tags_map: FxHashMap<&str, Vec<usize>> = FxHashMap::default();
+    posts
+        .into_par_iter()
+        .enumerate()
+        .map(|(idx, post)| {
+            let mut tagged_post_count = vec![0; posts.len()];
 
-    for (i, post) in posts.iter().enumerate() {
-        for tag in &post.tags {
-            post_tags_map.entry(tag).or_default().push(i);
-        }
-    }
-
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(num_cpus)
-        .build()
-        .unwrap();
-
-    pool.install(|| {
-        let related_posts: Vec<RelatedPosts<'_>> = posts
-            .par_iter()
-            .enumerate()
-            .map(|(idx, post)| {
-                // faster than allocating outside the loop
-                let mut tagged_post_count = vec![0; posts.len()];
-
-                for tag in &post.tags {
-                    if let Some(tag_posts) = post_tags_map.get(tag.as_str()) {
-                        for &other_post_idx in tag_posts {
-                            tagged_post_count[other_post_idx] += 1;
-                        }
+            for tag in &post.tags {
+                if let Some(tag_posts) = post_tags_map.get(tag) {
+                    for &other_post_idx in tag_posts {
+                        tagged_post_count[other_post_idx] += 1;
                     }
                 }
+            }
 
-                tagged_post_count[idx] = 0; // don't recommend the same post
+            tagged_post_count[idx] = 0; // don't recommend the same post
 
-                let top = least_n(
-                    NUM_TOP_ITEMS,
-                    tagged_post_count
-                        .into_iter()
-                        .enumerate()
-                        .map(|(post, count)| PostCount { post, count }),
-                );
-                let related = top.map(|it| &posts[it.post]).collect();
+            let top = least_n(
+                NUM_TOP_ITEMS,
+                tagged_post_count
+                    .into_iter()
+                    .enumerate()
+                    .map(|(post, count)| PostCount { post, count }),
+            );
+            let related = top.map(|it| &posts[it.post]).collect();
 
-                RelatedPosts {
-                    _id: &post._id,
-                    tags: &post.tags,
-                    related,
-                }
-            })
-            .collect();
+            RelatedPosts {
+                _id: post._id,
+                tags: &post.tags,
+                related,
+            }
+        })
+        .collect()
+}
 
-        let end = Instant::now();
+fn main() {
+    let input = std::fs::read_to_string("../posts.json").unwrap();
+    let posts: Vec<Post> = from_str(&input).unwrap();
 
-        print!(
-            "Processing time (w/o IO): {:?}\n",
-            end.duration_since(start)
-        );
+    let start = Instant::now();
+    let related_posts = posts_to_related(&posts);
+    let end = Instant::now();
 
-        let json_str = serde_json::to_string(&related_posts).unwrap();
-        std::fs::write("../related_posts_rust_con.json", json_str).unwrap();
-    });
+    print!(
+        "Processing time (w/o IO): {:?}\n",
+        end.duration_since(start)
+    );
+
+    let json_str = serde_json::to_string(&related_posts).unwrap();
+    std::fs::write("../related_posts_rust_con.json", json_str).unwrap();
 }

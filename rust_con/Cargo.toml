@@ -6,15 +6,13 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+ahash = { version = "0.8.3", features = ["std", "compile-time-rng"] }
 mimalloc = "0.1.39"
-num_cpus = "1.16.0"
 rayon = "1.8.0"
-rustc_data_structures = "0.0.1"
 serde =  { version = "1.0.188", features = ["derive"] }
 serde_json = "1.0.107"
-smallstr = { version = "0.3.0", features = ["serde"] }
 
 [profile.release]
-lto = true
+lto = "fat"
 codegen-units = 1
 debug = "line-tables-only"
